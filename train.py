@@ -66,6 +66,8 @@ decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+# muP settings
+mup_width_mult = 1.0
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -257,7 +259,10 @@ while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+        if any(name.endswith(('weight', 'bias')) and ('q_proj' in name or 'k_proj' in name or 'v_proj' in name or 'o_proj' in name or 'c_fc' in name or 'c_proj' in name) for name, _ in param_group['params']):
+            param_group['lr'] = lr / mup_width_mult
+        else:
+            param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:

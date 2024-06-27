@@ -64,7 +64,10 @@ class CausalSelfAttention(nn.Module):
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            if self.mup:
+                att = (q @ k.transpose(-2, -1)) * (1.0 / k.size(-1))
+            else:
+                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
@@ -83,6 +86,16 @@ class MLP(nn.Module):
         self.gelu    = nn.GELU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
+        if config.mup:
+            mup_init_std = config.init_std / math.sqrt(config.mup_width_mult)
+            # Reinitialize weights for c_fc
+            nn.init.normal_(self.c_fc.weight, mean=0.0, std=mup_init_std)
+            if self.c_fc.bias is not None:
+                nn.init.zeros_(self.c_fc.bias)
+            # Reinitialize weights for c_proj
+            nn.init.normal_(self.c_proj.weight, mean=0.0, std=mup_init_std)
+            if self.c_proj.bias is not None:
+                nn.init.zeros_(self.c_proj.bias)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -114,6 +127,12 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    # mup
+    mup: bool = False
+    init_std: float = 0.02
+    mup_width_mult: float = 1.0
+    mup_embedding_mult: float = None
+    mup_output_logit_multiplier: float = None
 
 class GPT(nn.Module):
 
@@ -137,12 +156,20 @@ class GPT(nn.Module):
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
+        # mup
+        self.mup_embedding_mult = config.mup_embedding_mult if hasattr(config, 'mup_embedding_mult') else None
+        self.mup_output_logit_multiplier = config.mup_output_logit_multiplier if hasattr(config, 'mup_output_logit_multiplier') else None
+
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+            if config.mup:
+                if any(n in pn for n in ['c_attn', 'c_proj', 'c_fc']):
+                    mup_init_std = config.init_std / math.sqrt(config.mup_width_mult)
+                    torch.nn.init.normal_(p, mean=0.0, std=mup_init_std)
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -176,7 +203,13 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+
+        # mup
+        if self.mup_embedding_mult is not None:
+            x = self.mup_embedding_mult * self.transformer.drop(tok_emb + pos_emb)
+        else:
+            x = self.transformer.drop(tok_emb + pos_emb)
+
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -189,6 +222,10 @@ class GPT(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
+
+        # mup
+        if self.mup_output_logit_multiplier is not None:
+            logits *= self.mup_output_logit_multiplier
 
         return logits, loss
 
