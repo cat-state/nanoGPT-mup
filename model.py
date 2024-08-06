@@ -35,6 +35,8 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # mup
+        self.use_mup = config.use_mup
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -64,7 +66,7 @@ class CausalSelfAttention(nn.Module):
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
-            if self.mup:
+            if self.use_mup:
                 att = (q @ k.transpose(-2, -1)) * (1.0 / k.size(-1))
             else:
                 att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -86,7 +88,7 @@ class MLP(nn.Module):
         self.gelu    = nn.GELU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
-        if config.mup:
+        if config.use_mup:
             mup_init_std = config.init_std / math.sqrt(config.mup_width_mult)
             # Reinitialize weights for c_fc
             nn.init.normal_(self.c_fc.weight, mean=0.0, std=mup_init_std)
@@ -128,7 +130,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     # mup
-    mup: bool = False
+    use_mup: bool = False
     init_std: float = 0.02
     mup_width_mult: float = 1.0
     mup_embedding_mult: float = None
@@ -166,7 +168,7 @@ class GPT(nn.Module):
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-            if config.mup:
+            if config.use_mup:
                 if any(n in pn for n in ['c_attn', 'c_proj', 'c_fc']):
                     mup_init_std = config.init_std / math.sqrt(config.mup_width_mult)
                     torch.nn.init.normal_(p, mean=0.0, std=mup_init_std)

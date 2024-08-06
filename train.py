@@ -45,8 +45,8 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 2 # used to simulate larger batch sizes
+batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 12
@@ -67,7 +67,10 @@ warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # muP settings
+use_mup = True
+take_coord_check = True
 mup_width_mult = 1.0
+mup_width_list = [64, 128, 256, 512, 1024, 2048, 4096, 8192]
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -258,11 +261,28 @@ while True:
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        if any(name.endswith(('weight', 'bias')) and ('q_proj' in name or 'k_proj' in name or 'v_proj' in name or 'o_proj' in name or 'c_fc' in name or 'c_proj' in name) for name, _ in param_group['params']):
-            param_group['lr'] = lr / mup_width_mult
-        else:
-            param_group['lr'] = lr
+    #for pn, p in model.named_parameters():
+    #    print(pn)
+    # Create a dictionary to map parameter names to optimizer param groups
+    param_to_group = {}
+    for group in optimizer.param_groups:
+        for p in group['params']:
+            param_to_group[p] = group
+    
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if param in param_to_group:
+                param_group = param_to_group[param]
+                
+                # Check if the parameter is part of attention or MLP layers
+                if any(proj in name for proj in ['c_attn', 'c_fc', 'c_proj']) and name.endswith(('weight', 'bias')):
+                    param_group['lr'] = lr / mup_width_mult
+                    #print(f'mup param: {name}')
+                else:
+                    param_group['lr'] = lr
+                    #print(f'NOT mup param: {name}')
+            else:
+                print(f"Warning: Parameter {name} not found in optimizer. Skipping.")
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -329,7 +349,9 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        else:
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
     iter_num += 1
     local_iter_num += 1
 
