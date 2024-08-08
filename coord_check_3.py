@@ -63,7 +63,7 @@ def get_config():
         'use_mup': True,
         'mup_width_mult': 2048. / 64.,
         'mup_width_list': [2048],# [64, 128, 256, 512, 1024, 2048],
-        'mup_lr_list': [2**(-17), 2**(-11), 2**(-9),], #[2**(-20), 2**(-18), 2**(-16), 2**(-14), 2**(-12), 2**(-10), 2**(-8), 2**(-6)],
+        'mup_lr_list': [2**(-8), 2**(-7), 2**(-6),], #[2**(-20), 2**(-18), 2**(-16), 2**(-14), 2**(-12), 2**(-10), 2**(-8), 2**(-6)],
         
         # DDP settings
         'backend': 'nccl',
@@ -233,6 +233,29 @@ def train(model, config, ddp, master_process, ctx, get_batch):
         lr = get_lr(config, iter_num) if config['decay_lr'] else config['learning_rate']
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
+
+        #for pn, p in model.named_parameters():
+        #    print(pn)
+        # Create a dictionary to map parameter names to optimizer param groups
+        param_to_group = {}
+        for group in optimizer.param_groups:
+            for p in group['params']:
+                param_to_group[p] = group
+
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                if param in param_to_group:
+                    param_group = param_to_group[param]
+
+                    # Check if the parameter is part of attention or MLP layers
+                    if any(proj in name for proj in ['c_attn', 'c_fc', 'c_proj']) and name.endswith(('weight', 'bias')):
+                        param_group['lr'] = lr / config['mup_width_mult']
+                        #print(f'mup param: {name}')
+                    else:
+                        param_group['lr'] = lr
+                        #print(f'NOT mup param: {name}')
+                else:
+                    print(f"Warning: Parameter {name} not found in optimizer. Skipping.")
         
         # Evaluate the model
         if iter_num % config['eval_interval'] == 0 and master_process:

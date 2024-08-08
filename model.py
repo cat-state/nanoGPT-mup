@@ -144,6 +144,9 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        self.activation_sizes = {}
+
+
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
@@ -173,8 +176,32 @@ class GPT(nn.Module):
                     mup_init_std = config.init_std / math.sqrt(config.mup_width_mult)
                     torch.nn.init.normal_(p, mean=0.0, std=mup_init_std)
 
+        self._add_activation_hooks()
+
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+    def _add_activation_hooks(self):
+        def hook_fn(name):
+            def forward_hook(module, input, output):
+                self.activation_sizes[name] = output.abs().mean().item()
+            return forward_hook
+        # Add hooks to embedding layers
+        self.transformer.wte.register_forward_hook(hook_fn('token_embedding'))
+        self.transformer.wpe.register_forward_hook(hook_fn('position_embedding'))
+
+        # Add hooks to all transformer blocks
+        for i, block in enumerate(self.transformer.h):
+            block.ln_1.register_forward_hook(hook_fn(f'block_{i}_ln_1'))
+            block.attn.register_forward_hook(hook_fn(f'block_{i}_attn'))
+            block.ln_2.register_forward_hook(hook_fn(f'block_{i}_ln_2'))
+            block.mlp.register_forward_hook(hook_fn(f'block_{i}_mlp'))
+
+        # Add hook to final layer norm
+        self.transformer.ln_f.register_forward_hook(hook_fn('final_ln'))
+
+        # Add hook to language model head
+        self.lm_head.register_forward_hook(hook_fn('lm_head'))
 
     def get_num_params(self, non_embedding=True):
         """
@@ -197,6 +224,7 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
+        self.activation_sizes.clear()
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -230,6 +258,9 @@ class GPT(nn.Module):
             logits *= self.mup_output_logit_multiplier
 
         return logits, loss
+
+    def get_activation_sizes(self):
+        return self.activation_sizes
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
