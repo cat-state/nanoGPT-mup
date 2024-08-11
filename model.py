@@ -92,12 +92,8 @@ class MLP(nn.Module):
             mup_init_std = config.init_std / math.sqrt(config.mup_width_mult)
             # Reinitialize weights for c_fc
             nn.init.normal_(self.c_fc.weight, mean=0.0, std=mup_init_std)
-            if self.c_fc.bias is not None:
-                nn.init.zeros_(self.c_fc.bias)
             # Reinitialize weights for c_proj
             nn.init.normal_(self.c_proj.weight, mean=0.0, std=mup_init_std)
-            if self.c_proj.bias is not None:
-                nn.init.zeros_(self.c_proj.bias)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -162,6 +158,8 @@ class GPT(nn.Module):
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # mup
+        self.use_mup = config.use_mup
+        self.mup_width_mult = config.mup_width_mult
         self.mup_embedding_mult = config.mup_embedding_mult if hasattr(config, 'mup_embedding_mult') else None
         self.mup_output_logit_multiplier = config.mup_output_logit_multiplier if hasattr(config, 'mup_output_logit_multiplier') else None
 
@@ -174,6 +172,9 @@ class GPT(nn.Module):
             if config.use_mup:
                 if any(n in pn for n in ['c_attn', 'c_proj', 'c_fc']):
                     mup_init_std = config.init_std / math.sqrt(config.mup_width_mult)
+                    torch.nn.init.normal_(p, mean=0.0, std=mup_init_std)
+                elif any(n in pn for n in ['c_proj']):
+                    mup_init_std = config.init_std / math.sqrt(2 * config.n_layer * config.mup_width_mult)
                     torch.nn.init.normal_(p, mean=0.0, std=mup_init_std)
 
         self._add_activation_hooks()
@@ -254,6 +255,8 @@ class GPT(nn.Module):
             loss = None
 
         # mup
+        if self.use_mup:
+            logits /= self.mup_width_mult
         if self.mup_output_logit_multiplier is not None:
             logits *= self.mup_output_logit_multiplier
 
