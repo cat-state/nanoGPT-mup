@@ -67,6 +67,7 @@ class CausalSelfAttention(nn.Module):
         else:
             # manual implementation of attention
             if self.use_mup:
+                # If we're using mup, divide by d instead of sqrt(d) to account for correlation between Q and K that emerges during training.
                 att = (q @ k.transpose(-2, -1)) * (1.0 / k.size(-1))
             else:
                 att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -89,6 +90,7 @@ class MLP(nn.Module):
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
         if config.use_mup:
+            # TODO: remove these and sanity check
             mup_init_std = config.init_std / math.sqrt(config.mup_width_mult)
             # Reinitialize weights for c_fc
             nn.init.normal_(self.c_fc.weight, mean=0.0, std=mup_init_std)
@@ -118,14 +120,18 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
+    # data settings
     block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency. See (https://arxiv.org/abs/2401.14489) for a deep dive on why this is useful.
+
+    # model settings
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    # mup
+
+    # mup settings
     use_mup: bool = False
     init_std: float = 0.02
     mup_width_mult: float = 1.0
@@ -168,8 +174,9 @@ class GPT(nn.Module):
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+                torch.nn.init.normal_(p, mean=0.0, std=config.init_std/math.sqrt(2 * config.n_layer))
             if config.use_mup:
+                # Update hidden initialization variance to 1/sqrt(m_d)
                 if any(n in pn for n in ['c_attn', 'c_proj', 'c_fc']):
                     mup_init_std = config.init_std / math.sqrt(config.mup_width_mult)
                     torch.nn.init.normal_(p, mean=0.0, std=mup_init_std)
@@ -218,11 +225,11 @@ class GPT(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.init_std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.init_std)
 
     def forward(self, idx, targets=None):
         self.activation_sizes.clear()
@@ -237,7 +244,7 @@ class GPT(nn.Module):
 
         # mup
         if self.mup_embedding_mult is not None:
-            x = self.mup_embedding_mult * self.transformer.drop(tok_emb + pos_emb)
+            x = self.mup_embedding_mult * self.transformer.drop(tok_emb + pos_emb) # apply embedding multiplier
         else:
             x = self.transformer.drop(tok_emb + pos_emb)
 
@@ -256,9 +263,9 @@ class GPT(nn.Module):
 
         # mup
         if self.use_mup:
-            logits /= self.mup_width_mult
+            logits /= self.mup_width_mult # scale output logits by width multiplier
         if self.mup_output_logit_multiplier is not None:
-            logits *= self.mup_output_logit_multiplier
+            logits *= self.mup_output_logit_multiplier # optionally apply unembedding multiplier
 
         return logits, loss
 
