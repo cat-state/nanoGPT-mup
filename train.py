@@ -249,13 +249,13 @@ def train(model, config, ddp, master_process, ctx, get_batch):
                 if param in param_to_group:
                     param_group = param_to_group[param]
 
-                    # Check if the parameter is part of attention or MLP layers
+                    ### Begin muP code ###
+                    # Scale LR by mup width multiplier for hidden params
                     if any(proj in name for proj in ['c_attn', 'c_fc', 'c_proj']) and name.endswith(('weight')):
                         param_group['lr'] = lr / config['mup_width_mult']
-                        #print(f'mup param: {name}')
                     else:
                         param_group['lr'] = lr
-                        #print(f'NOT mup param: {name}')
+                    ### End muP code ###
                 else:
                     print(f"Warning: Parameter {name} not found in optimizer. Skipping.")
         

@@ -66,9 +66,11 @@ class CausalSelfAttention(nn.Module):
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
+            ### Begin muP code ###
             if self.use_mup:
                 # If we're using mup, divide by d instead of sqrt(d) to account for correlation between Q and K that emerges during training.
                 att = (q @ k.transpose(-2, -1)) * (1.0 / k.size(-1))
+            ### End muP code ###
             else:
                 att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
@@ -89,13 +91,6 @@ class MLP(nn.Module):
         self.gelu    = nn.GELU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
-        if config.use_mup:
-            # TODO: remove these and sanity check
-            mup_init_std = config.init_std / math.sqrt(config.mup_width_mult)
-            # Reinitialize weights for c_fc
-            nn.init.normal_(self.c_fc.weight, mean=0.0, std=mup_init_std)
-            # Reinitialize weights for c_proj
-            nn.init.normal_(self.c_proj.weight, mean=0.0, std=mup_init_std)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -135,8 +130,8 @@ class GPTConfig:
     use_mup: bool = False
     init_std: float = 0.02
     mup_width_mult: float = 1.0
-    mup_embedding_mult: float = None
-    mup_output_logit_multiplier: float = None
+    mup_alpha_input: float = None # (optional) input embedding multiplier
+    mup_alpha_output: float = None # (optional) output logit multiplier
 
 class GPT(nn.Module):
 
@@ -166,8 +161,8 @@ class GPT(nn.Module):
         # mup
         self.use_mup = config.use_mup
         self.mup_width_mult = config.mup_width_mult
-        self.mup_embedding_mult = config.mup_embedding_mult if hasattr(config, 'mup_embedding_mult') else None
-        self.mup_output_logit_multiplier = config.mup_output_logit_multiplier if hasattr(config, 'mup_output_logit_multiplier') else None
+        self.mup_alpha_input = config.mup_alpha_input if hasattr(config, 'mup_alpha_input') else None
+        self.mup_alpha_output = config.mup_alpha_output if hasattr(config, 'mup_alpha_output') else None
 
         # init all weights
         self.apply(self._init_weights)
@@ -175,14 +170,16 @@ class GPT(nn.Module):
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=config.init_std/math.sqrt(2 * config.n_layer))
+            ### Begin muP code ###
             if config.use_mup:
                 # Update hidden initialization variance to 1/sqrt(m_d)
-                if any(n in pn for n in ['c_attn', 'c_proj', 'c_fc']):
+                if any(n in pn for n in ['c_attn', 'c_fc']):
                     mup_init_std = config.init_std / math.sqrt(config.mup_width_mult)
                     torch.nn.init.normal_(p, mean=0.0, std=mup_init_std)
                 elif any(n in pn for n in ['c_proj']):
                     mup_init_std = config.init_std / math.sqrt(2 * config.n_layer * config.mup_width_mult)
                     torch.nn.init.normal_(p, mean=0.0, std=mup_init_std)
+            ### End muP code ###
 
         self._add_activation_hooks()
 
@@ -242,9 +239,10 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
 
-        # mup
-        if self.mup_embedding_mult is not None:
-            x = self.mup_embedding_mult * self.transformer.drop(tok_emb + pos_emb) # apply embedding multiplier
+        ### Begin muP code ###
+        if self.mup_alpha_input is not None:
+            x = self.mup_alpha_input * self.transformer.drop(tok_emb + pos_emb) # apply embedding multiplier
+        ### End muP code ###
         else:
             x = self.transformer.drop(tok_emb + pos_emb)
 
@@ -261,11 +259,12 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        # mup
+        ### Begin muP code ###
         if self.use_mup:
             logits /= self.mup_width_mult # scale output logits by width multiplier
-        if self.mup_output_logit_multiplier is not None:
-            logits *= self.mup_output_logit_multiplier # optionally apply unembedding multiplier
+        if self.mup_alpha_output is not None:
+            logits *= self.mup_alpha_output # optionally apply unembedding multiplier
+        ### End muP code ###
 
         return logits, loss
 
