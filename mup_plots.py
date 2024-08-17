@@ -76,9 +76,9 @@ def plot_coordinate_check(csv_file):
         ax.set_xticklabels([f'2^{i}' for i in range(6, 11)], fontsize=10)
 
         # Set y-axis ticks
-        y_ticks = [2**i for i in range(-10, 1, 2)]  # Adjust this range as needed
+        y_ticks = [2**i for i in range(-1, 1, 1)]  # Adjust this range as needed
         ax.set_yticks(y_ticks)
-        ax.set_yticklabels([f'2^{i}' for i in range(-10, 1, 2)], fontsize=10)
+        ax.set_yticklabels([f'2^{i}' for i in range(-1, 1, 1)], fontsize=10)
 
         ax.tick_params(axis='both', which='major', labelsize=10)
 

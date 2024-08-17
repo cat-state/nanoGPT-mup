@@ -63,6 +63,7 @@ def get_config():
         # muP settings
         'use_mup': True,
         #'mup_width_mult': 64. / 64.,
+        'mup_base_width': 64., # Either pass the width multiplier (which is width(big_target_model) / width(small_base_model)), or the width of the base model
         'mup_width_list': [64, 128, 256, 512, 1024],#, 2048],
         'mup_lr_list': [2**(-6), 2**(-7), 2**(-8), 2**(-9), 2**(-10), 2**(-11), 2**(-12), 2**(-13), 2**(-14), 2**(-15), 2**(-16), 2**(-17), 2**(-18), 2**(-19), 2**(-20)],
         'mup_coord_check_only': True,
@@ -294,21 +295,18 @@ def train(model, config, ddp, master_process, ctx, get_batch):
             with ctx:
                 logits, loss = model(X, Y)
                 loss = loss / config['gradient_accumulation_steps']
+            ### Begin muP code ### 
             if config['mup_coord_check_only'] and micro_step == config['gradient_accumulation_steps'] - 1:
                 activation_sizes = model.get_activation_sizes()
-                # Calculate average L1 norm per block
-                layer_l1 = [sum(v for k, v in model.get_activation_sizes().items() if f'block_{i}_attn') for i in range(config['n_layer'])]
+                # Calculate average L1 norm per layer
+                layer_l1 = [next((v for k, v in model.get_activation_sizes().items() if f'block_{i}_ln_2' in k), None) for i in range(config['n_layer'])]
 
                 mup_l1_layers = []
                 for i in layer_l1:
                     mup_l1_layers.append(i)
 
                 mup_l1_coord[iter_num] = mup_l1_layers.copy()
-
-                #mean_activation_size = sum(model.get_activation_sizes().values()) / len(model.get_activation_sizes())
-                #print(activation_sizes)
-                #exit()
-                #print(f'L1 norm: {mean_activation_size}')
+            ### End muP code ###
 
             X, Y = get_batch('train', config)
             scaler.scale(loss).backward()
@@ -344,6 +342,7 @@ def train(model, config, ddp, master_process, ctx, get_batch):
         # Check for termination
         if iter_num > config['max_iters']:
             break
+        # End early if we're doing a coord check
         elif iter_num > config['mup_coord_check_iters']:
             break
 
@@ -361,14 +360,14 @@ if __name__ == "__main__":
     ddp, master_process, seed_offset, device_type, ctx = setup_training(config)
 
     if not config['mup_coord_check_only']:
-        # Case 1: Hyperparameter transfer tests
+        # Case 1: Standard training or Hyperparameter transfer tests
         avg_losses = {}
         for width in config['mup_width_list']:
             for lr in config['mup_lr_list']:
                 print(f'lr: {math.log2(lr)}')
                 print(f'width: {width}')
 
-                config['mup_width_mult'] = float(width) / 64.
+                config['mup_width_mult'] = float(width) / config['mup_base_width']
                 config['n_embd'] = width
                 config['learning_rate'] = lr
 
@@ -391,10 +390,11 @@ if __name__ == "__main__":
                 writer.writerow([width, log2_lr, loss])
 
     else:
-        # Case 2: Coordinate checks
+        # Case 2: muP coordinate checks
         mup_l1_coord = {}
         for width in config['mup_width_list']:
-            config['mup_width_mult'] = float(width) / 64.
+            if config['mup_width_mult'] is None: # Calculate the width multiplier if we didn't explicitly pass it
+                config['mup_width_mult'] = float(width) / config['mup_base_width']
             config['n_embd'] = width
 
             # Initialize model
@@ -408,7 +408,6 @@ if __name__ == "__main__":
             gc.collect()
             torch.cuda.empty_cache()
 
-        #print(mup_l1_coord)
         # Write data to CSV
         with open('coordinate_check.csv', 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
