@@ -5,6 +5,7 @@ import pickle
 from contextlib import nullcontext
 import wandb
 import gc
+import csv
 
 import numpy as np
 import torch
@@ -32,19 +33,19 @@ def get_config():
         
         # Data
         'dataset': 'openwebtext',
-        'gradient_accumulation_steps': 64,
-        'batch_size': 2,
+        'gradient_accumulation_steps': 16,
+        'batch_size': 4,
         'block_size': 1024,
         
         # Model
-        'n_layer': 2,
+        'n_layer': 12,
         'n_head': 16,
         'n_embd': 512,
         'dropout': 0.0,
         'bias': False,
         
         # Optimizer
-        'learning_rate': 6e-4,
+        'learning_rate': 6e-3,
         'max_iters': 400,
         'weight_decay': 1e-1,
         'beta1': 0.9,
@@ -62,9 +63,9 @@ def get_config():
         # muP settings
         'use_mup': True,
         #'mup_width_mult': 64. / 64.,
-        'mup_width_list': [2048], #[64, 128, 256, 512, 1024],#, 2048],
+        'mup_width_list': [64, 128, 256, 512, 1024],#, 2048],
         'mup_lr_list': [2**(-6), 2**(-7), 2**(-8), 2**(-9), 2**(-10), 2**(-11), 2**(-12), 2**(-13), 2**(-14), 2**(-15), 2**(-16), 2**(-17), 2**(-18), 2**(-19), 2**(-20)],
-        'mup_coord_check_only': False,
+        'mup_coord_check_only': True,
         'mup_coord_check_iters': 10,
         
         # DDP settings
@@ -229,6 +230,7 @@ def train(model, config, ddp, master_process, ctx, get_batch):
     best_val_loss = config['start_best_val_loss']
     loss_avg = 1
 
+    mup_l1_coord = {}
     
     while True:
         # Learning rate decay
@@ -236,8 +238,6 @@ def train(model, config, ddp, master_process, ctx, get_batch):
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        #for pn, p in model.named_parameters():
-        #    print(pn)
         # Create a dictionary to map parameter names to optimizer param groups
         param_to_group = {}
         for group in optimizer.param_groups:
@@ -297,19 +297,18 @@ def train(model, config, ddp, master_process, ctx, get_batch):
             if config['mup_coord_check_only'] and micro_step == config['gradient_accumulation_steps'] - 1:
                 activation_sizes = model.get_activation_sizes()
                 # Calculate average L1 norm per block
-                layer_averages = [sum(v for k, v in model.get_activation_sizes().items() if f'block_{i}_' in k) / 4 for i in range(config['n_layer'])]
+                layer_l1 = [sum(v for k, v in model.get_activation_sizes().items() if f'block_{i}_attn') for i in range(config['n_layer'])]
 
-                #print(f'layer_averages: {layer_averages}')
-                print(f'iter {iter_num}')
-                for i in layer_averages:
-                    print(i)
+                mup_l1_layers = []
+                for i in layer_l1:
+                    mup_l1_layers.append(i)
+
+                mup_l1_coord[iter_num] = mup_l1_layers.copy()
 
                 #mean_activation_size = sum(model.get_activation_sizes().values()) / len(model.get_activation_sizes())
                 #print(activation_sizes)
                 #exit()
                 #print(f'L1 norm: {mean_activation_size}')
-                if iter_num > config['mup_coord_check_iters']:
-                    return
 
             X, Y = get_batch('train', config)
             scaler.scale(loss).backward()
@@ -341,43 +340,82 @@ def train(model, config, ddp, master_process, ctx, get_batch):
                 print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
         iter_num += 1
         local_iter_num += 1
-        
+
         # Check for termination
         if iter_num > config['max_iters']:
+            break
+        elif iter_num > config['mup_coord_check_iters']:
             break
 
     if ddp:
         destroy_process_group()
 
-    return loss_avg
+    return mup_l1_coord if config['mup_coord_check_only'] else loss_avg
+
 
 if __name__ == "__main__":
     # Load configuration
     config = get_config()
-    
+
     # Setup training environment
     ddp, master_process, seed_offset, device_type, ctx = setup_training(config)
-    
-    avg_losses = {}
-    for width in config['mup_width_list']:
-        for lr in config['mup_lr_list']:
-            print(f'lr: {math.log2(lr)}')
-            print(f'width: {width}')
 
-            # TODO: hardcode this for now
-            config['mup_width_mult'] = float(width) / 64. #float(config['mup_width_list'][0])
+    if not config['mup_coord_check_only']:
+        # Case 1: Hyperparameter transfer tests
+        avg_losses = {}
+        for width in config['mup_width_list']:
+            for lr in config['mup_lr_list']:
+                print(f'lr: {math.log2(lr)}')
+                print(f'width: {width}')
+
+                config['mup_width_mult'] = float(width) / 64.
+                config['n_embd'] = width
+                config['learning_rate'] = lr
+
+                # Initialize model
+                model, model_args = init_model(config)
+                model.to(device_type)
+
+                # Start training
+                avg_losses[(width, math.log2(lr))] = train(model, config, ddp, master_process, ctx, get_batch)
+
+                del model
+                gc.collect()
+                torch.cuda.empty_cache()
+
+        # Write data to CSV
+        with open('hyperparameter_transfer.csv', 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['Width', 'log2_LR', 'Loss'])
+            for (width, log2_lr), loss in avg_losses.items():
+                writer.writerow([width, log2_lr, loss])
+
+    else:
+        # Case 2: Coordinate checks
+        mup_l1_coord = {}
+        for width in config['mup_width_list']:
+            config['mup_width_mult'] = float(width) / 64.
             config['n_embd'] = width
-            config['learning_rate'] = lr
 
             # Initialize model
             model, model_args = init_model(config)
-
             model.to(device_type)
 
             # Start training
-            avg_losses[(width, math.log2(lr))] = train(model, config, ddp, master_process, ctx, get_batch)
+            mup_l1_coord[width] = train(model, config, ddp, master_process, ctx, get_batch)
 
             del model
             gc.collect()
             torch.cuda.empty_cache()
-    print(avg_losses)
+
+        #print(mup_l1_coord)
+        # Write data to CSV
+        with open('coordinate_check.csv', 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['Width', 'Iteration', 'Layer', 'L1_Norm'])
+            for width, iterations in mup_l1_coord.items():
+                for t, layers in iterations.items():
+                    for layer_idx in range(len(layers)):
+                        writer.writerow([width, t, layer_idx, layers[layer_idx]])
+
+    print("muP data has been written to CSV file.")
