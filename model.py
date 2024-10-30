@@ -14,6 +14,21 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import torch.nn.utils.parametrize as parametrize
+
+class StaticSparsityParameterization(nn.Module):
+    def __init__(self, weight, sparsity=0.0):
+        super().__init__()
+        mask = torch.full_like(weight, 1.0 - sparsity)
+        self.mask = torch.bernoulli(mask)
+
+    def forward(self, weight):
+        if weight.device != self.mask.device:
+            self.mask = self.mask.to(device=weight.device)
+        return weight * self.mask
+
+    def right_inverse(self, A):
+        return A
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -50,6 +65,9 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+        if config.sparsity > 0:
+            parametrize.register_parametrization(self.c_attn, "weight", StaticSparsityParameterization(self.c_attn.weight, config.sparsity))
+            parametrize.register_parametrization(self.c_proj, "weight", StaticSparsityParameterization(self.c_proj.weight, config.sparsity))
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -94,6 +112,9 @@ class MLP(nn.Module):
         self.gelu    = nn.GELU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
+        if config.sparsity > 0:
+            parametrize.register_parametrization(self.c_fc, "weight", StaticSparsityParameterization(self.c_fc.weight, config.sparsity))
+            parametrize.register_parametrization(self.c_proj, "weight", StaticSparsityParameterization(self.c_proj.weight, config.sparsity))
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -132,6 +153,8 @@ class GPTConfig:
     mup_width_multiplier: float = 1 # `mup_width_multiplier = width / base_width` where base_width is typically 256
     mup_input_alpha: float = 1 # Optional tunable multiplier applied to input embedding forward pass output
     mup_output_alpha: float = 1 # Optional tunable multiplier applied to output unembedding forward pass output
+    supar_enabled: bool = False # Whether to use SuPar. Requires mup_enabled=True to be active. If False then SuPar-specific adjustments are disabled.
+    sparsity: float = 0.0 # Level of random static unstructured sparsity between [0,1)
 
 class GPT(nn.Module):
 
@@ -159,16 +182,35 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
-            if config.mup_enabled:
-                ### Begin muP code ###
-                # Adjust hidden weight initialization variance by 1 / mup_width_multiplier
-                if pn.endswith('c_attn.weight') or pn.endswith('c_fc.weight'):
-                    torch.nn.init.normal_(p, mean=0.0, std=config.init_std / math.sqrt(config.mup_width_multiplier))
-                elif pn.endswith('c_proj.weight'):
-                    torch.nn.init.normal_(p, mean=0.0, std=config.init_std / math.sqrt(2 * config.n_layer * config.mup_width_multiplier))
-                ### End muP code ###
-            elif pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=config.init_std / math.sqrt(2 * config.n_layer))
+            if (
+                pn.endswith('c_attn.weight') or
+                pn.endswith('c_fc.weight') or
+                pn.endswith('c_attn.parametrizations.weight.original') or
+                pn.endswith('c_fc.parametrizations.weight.original')
+            ):
+                if config.mup_enabled:
+                    if config.supar_enabled and self.config.sparsity > 0:
+                        ### Begin SuPar code ###
+                        torch.nn.init.normal_(p, mean=0.0, std=config.init_std / math.sqrt(config.mup_width_multiplier * (1-config.sparsity)))
+                        ### End SuPar code ###
+                    else:
+                        ### Begin muP code ###
+                        torch.nn.init.normal_(p, mean=0.0, std=config.init_std / math.sqrt(config.mup_width_multiplier))
+                        ### End muP code ###
+                else:
+                    pass
+            elif pn.endswith('c_proj.weight') or pn.endswith('c_proj.parametrizations.weight.original'):
+                if config.mup_enabled:
+                    if config.supar_enabled and self.config.sparsity > 0:
+                        ### Begin SuPar code ###
+                        torch.nn.init.normal_(p, mean=0.0, std=config.init_std / math.sqrt(2 * config.n_layer * config.mup_width_multiplier * (1-config.sparsity)))
+                        ### End SuPar code ###
+                    else:
+                        ### Begin muP code ###
+                        torch.nn.init.normal_(p, mean=0.0, std=config.init_std / math.sqrt(2 * config.n_layer * config.mup_width_multiplier))
+                        ### End muP code ###
+                else:
+                    torch.nn.init.normal_(p, mean=0.0, std=config.init_std / math.sqrt(2 * config.n_layer))
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -303,30 +345,54 @@ class GPT(nn.Module):
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         if self.config.mup_enabled and not self.config.mup_disable_hidden_lr_scaling:
-            ### Begin muP code ###
             mup_decay_params = []
             decay_params = []
             nodecay_params = []
             for n, p in param_dict.items():
                 if p.dim() >= 2:
-                    if n.endswith('c_attn.weight') or n.endswith('c_fc.weight') or n.endswith('c_proj.weight'):
+                    if (
+                        n.endswith('c_attn.weight') or
+                        n.endswith('c_fc.weight') or
+                        n.endswith('c_proj.weight') or
+                        n.endswith('c_attn.parametrizations.weight.original') or
+                        n.endswith('c_fc.parametrizations.weight.original') or
+                        n.endswith('c_proj.parametrizations.weight.original')
+                    ):
                         mup_decay_params.append(p)
                     else:
                         decay_params.append(p)
                 else:
                     nodecay_params.append(p)
-            optim_groups = [
-                {'params': mup_decay_params, 'weight_decay': weight_decay, 'lr_scale': 1/self.config.mup_width_multiplier},
-                {'params': decay_params, 'weight_decay': weight_decay, 'lr_scale': 1},
-                {'params': nodecay_params, 'weight_decay': 0.0, 'lr_scale': 1}
-            ]
+            if self.config.supar_enabled and self.config.sparsity > 0:
+                ### Begin SuPar code ###
+                optim_groups = [
+                    {
+                        'params': mup_decay_params,
+                        'weight_decay': weight_decay,
+                        'lr_scale': 1 / (self.config.mup_width_multiplier * (1 - self.config.sparsity)),
+                    },
+                    {'params': decay_params, 'weight_decay': weight_decay, 'lr_scale': 1},
+                    {'params': nodecay_params, 'weight_decay': 0.0, 'lr_scale': 1}
+                ]
+                ### End SuPar code ###
+            else:
+                ### Begin muP code ###
+                optim_groups = [
+                    {
+                        'params': mup_decay_params,
+                        'weight_decay': weight_decay,
+                        'lr_scale': 1/self.config.mup_width_multiplier,
+                    },
+                    {'params': decay_params, 'weight_decay': weight_decay, 'lr_scale': 1},
+                    {'params': nodecay_params, 'weight_decay': 0.0, 'lr_scale': 1}
+                ]
+                ### End muP code ###
             num_mup_decay_params = sum(p.numel() for p in mup_decay_params)
             num_decay_params = sum(p.numel() for p in decay_params)
             num_nodecay_params = sum(p.numel() for p in nodecay_params)
             print(f"num mup decayed parameter tensors: {len(mup_decay_params)}, with {num_mup_decay_params:,} parameters")
             print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
             print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-            ### End muP code ###
         else:
             decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
             nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]

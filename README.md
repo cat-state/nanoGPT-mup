@@ -1,3 +1,15 @@
+# SuPar
+This branch contains a minimal implementation of the sparse maximal update parameterization (SuPar) from [Sparse maximal update parameterization: A holistic approach to sparse training dynamics](https://arxiv.org/abs/2405.15743). 
+
+Each of the critical SuPar changes are marked with
+```
+### Begin SuPar code ###
+<code for SuPar change>
+### End SuPar code ###
+```
+to make everything easily searchable.
+
+The `supar_examples` folder contains code to reproduce the sparse coordinate check (Figure 5) from the paper.
 
 # nanoGPT-mup
 

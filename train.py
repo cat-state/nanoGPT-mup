@@ -80,6 +80,9 @@ mup_width_multiplier = 1.0 # mup_width_multiplier = width / base_width where bas
 mup_input_alpha = 1.0 # Optional tunable multiplier applied to input embedding forward pass output
 mup_output_alpha = 1.0 # Optional tunable multiplier applied to output unembedding forward pass output
 mup_enable_coord_check_logging = False # If True will track the output.abs().mean() of various layers throughout training
+# sparsity settings
+supar_enabled = False # Whether to use SuPar. Requires mup_enabled=True to be active. If False then SuPar-specific adjustments are disabled.
+sparsity = 0.0 # Level of random static unstructured sparsity between [0,1)
 # seed
 seed = 1337
 # DDP settings
@@ -167,7 +170,8 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   mup_disable_attention_scaling=mup_disable_attention_scaling,
                   mup_disable_hidden_lr_scaling=mup_disable_hidden_lr_scaling,
                   mup_width_multiplier=mup_width_multiplier, mup_input_alpha=mup_input_alpha,
-                  mup_output_alpha=mup_output_alpha) # start with model_args from command line
+                  mup_output_alpha=mup_output_alpha, supar_enabled=supar_enabled,
+                  sparsity=sparsity) # start with model_args from command line
 
 if init_from == 'scratch':
     # init a new model from scratch
