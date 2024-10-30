@@ -12,6 +12,16 @@ The [supar_examples](https://github.com/EleutherAI/nanoGPT-mup/tree/supar/supar_
 
 ![sparse_coord_check](assets/sparse_coord_check.png)
 
+If you would like to cite [Sparse maximal update parameterization: A holistic approach to sparse training dynamics](https://arxiv.org/abs/2405.15743), please use:
+```
+@inproceedings{dey2024supar,
+    author = {Dey, Nolan and Bergsma, Shane and Hestness, Joel},
+    booktitle = {Advances in Neural Information Processing Systems},
+    title = "{Sparse maximal update parameterization: A holistic approach to sparse training dynamics}",
+    year = {2024}
+}
+```
+
 # nanoGPT-mup
 
 This repository is a fork of [nanoGPT](https://github.com/karpathy/nanoGPT) that provides a minimal implementation of the [maximal update parameterization](https://arxiv.org/abs/2203.03466) ([muP](https://github.com/microsoft/mup)) and acts as supplementary material for ["The Practitioner’s Guide to the Maximal Update Parameterization"](https://www.cerebras.ai/blog/the-practitioners-guide-to-the-maximal-update-parameterization). The [mup_examples](https://github.com/EleutherAI/nanoGPT-mup/tree/master/mup_examples) folder contains scripts to reproduce the plots in the blog post (see [mup_examples/README.md](https://github.com/EleutherAI/nanoGPT-mup/blob/master/mup_examples/README.md) for instructions to reproduce). 
