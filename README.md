@@ -9,7 +9,9 @@ Each of the critical SuPar changes are marked with
 ```
 to make everything easily searchable.
 
-The `supar_examples` folder contains code to reproduce the sparse coordinate check (Figure 5) from the paper.
+The `supar_examples` folder contains code to reproduce the sparse coordinate check (Figure 5) from the paper:
+
+<img src="assets/sparse_coord_check.png">
 
 # nanoGPT-mup
 
