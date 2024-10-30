@@ -1,5 +1,5 @@
 # SuPar
-This branch contains a minimal implementation of the sparse maximal update parameterization (SuPar) from [Sparse maximal update parameterization: A holistic approach to sparse training dynamics](https://arxiv.org/abs/2405.15743). 
+This branch contains a minimal implementation of sparse maximal update parameterization (SuPar) introduced in [Sparse maximal update parameterization: A holistic approach to sparse training dynamics](https://arxiv.org/abs/2405.15743). 
 
 To make everything easily searchable, each of the critical SuPar changes are marked with:
 ```
