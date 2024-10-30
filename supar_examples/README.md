@@ -11,4 +11,4 @@ bash supar_examples/coord_check_shakespeare_char/sp/run.sh
 
 Finally `supar_examples/coord_check_shakespeare_char/plot.ipynb` contains the code to produce the following figure:
 
-<img src="assets/sparse_coord_check.png">
+![sparse_coord_check](../assets/sparse_coord_check.png)
