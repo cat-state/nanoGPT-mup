@@ -17,6 +17,27 @@ from torch.nn import functional as F
 
 
 
+
+
+def log_mean(x, dim):
+    return torch.logsumexp(x, dim=dim) - torch.log(
+        torch.tensor(x.shape[dim], dtype=torch.float32)
+    )
+
+
+def entropy_reg(logits: torch.Tensor, mean_over_batch: bool = True):
+    """Entropy regularization for the router."""
+
+    entropy_l = lambda l: -(l * l.exp()).sum(-1)
+    # softmax over experts
+    # logits: [batch_size * sequence_length, num_experts]
+    logprobs = F.log_softmax(logits, dim=-1)
+    if mean_over_batch:
+        # take mean probability over batch
+        logprobs = log_mean(logprobs, 0)
+
+    return -entropy_l(logprobs).mean()
+
 # two losses below are adapted from
 # https://github.com/google/flaxformer/blob/b725bd2a51d70e866d819c92de166fbf24425e6a/flaxformer/architectures/moe/routing.py
 def load_balancing_loss(logits: torch.Tensor, expert_indices: torch.Tensor) -> float:
