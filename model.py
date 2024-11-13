@@ -15,6 +15,74 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+
+
+# two losses below are adapted from
+# https://github.com/google/flaxformer/blob/b725bd2a51d70e866d819c92de166fbf24425e6a/flaxformer/architectures/moe/routing.py
+def load_balancing_loss(logits: torch.Tensor, expert_indices: torch.Tensor) -> float:
+    """Computes auxiliary load balancing loss as in Switch Transformer.
+
+    See Switch Transformer (https://arxiv.org/abs/2101.03961). This function
+    implements the loss function presented in equations (4) - (6). It aims to
+    penalize those cases where the routing between experts is unbalanced.
+
+    Args:
+      logits: logits assigned to each expert per token. Shape:
+        <float32>[batch_size * sequence_length, num_experts].
+      expert_indices: <int>[batch_size * sequence_length, num_selected_experts]
+        indices identifying the top num_selected_experts for a given token.
+
+    Returns:
+      The auxiliary loss.
+    """
+    # num_token = batch_size * sequence_length
+    num_token, num_experts = logits.shape
+
+    # Shape: [batch_size * sequence_length, num_selected_experts, num_experts].
+    expert_mask = F.one_hot(expert_indices, num_experts)
+    # For a given token, determine if it was routed to a given expert.
+    # Shape: [batch_size * sequence_length, num_experts]
+    expert_mask, _ = torch.max(expert_mask, dim=-2)
+
+    # shape [num_experts]
+    tokens_per_expert = torch.mean(expert_mask, dim=0, dtype=torch.float32)
+
+    # compute router probability per expert in log space for numerical stability
+    logprobs = F.log_softmax(logits, dim=-1)
+    # take mean probability over batch
+    # shape [num_experts]
+    logprobs = log_mean(logprobs, dim=0)
+    router_prob_per_expert = torch.exp(logprobs)
+    return (
+        torch.mean(  # mean over experts
+            tokens_per_expert * router_prob_per_expert,
+            dtype=torch.float32,
+        )
+        * num_experts
+    )
+
+
+def router_z_loss(router_logits: torch.Tensor) -> float:
+    """Compute router z-loss.
+
+     The router z-loss was introduced in Designing Effective Sparse Expert Models
+     (https://arxiv.org/abs/2202.08906). It encourages router logits to remain
+     small in an effort to improve stability.
+
+    Args:
+      router_logits: <float>[batch_size * sequence_length, num_experts]
+        router logits
+
+    Returns:
+      Scalar router z-loss.
+    """
+    num_tokens, _ = router_logits.shape
+    log_z = torch.logsumexp(router_logits, dim=-1)
+    z_loss = log_z**2
+    return torch.sum(z_loss, dtype=torch.float32) / (num_tokens)
+
+
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -109,12 +177,70 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+
+        if config.use_moe:
+            print("using mixture of experts")
+            self.ff = MoE(config)
+        else:
+            print("using regular MLP")
+            self.ff = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = self.ff(self.ln_2(x))
         return x
+
+
+class MoE(nn.Module):
+    """
+    Simplest MoE implementation with a linear router and softmax over experts.
+
+    Note that in this implementation, we simply loop over the experts and
+    aggregate the results. This is not the most efficient way to do it, but
+    it also avoids the large memory overhead _and_ has no token dropping
+    (because we do not need the capacity factor).
+    """
+
+    def __init__(self, config, mlp):
+        super().__init__()
+        assert config.moe_num_experts > 0
+        self.experts = nn.ModuleList(
+            [mlp(config=config) for _ in range(config.moe_num_experts)]
+        )
+        self.router = nn.Linear(config.n_embd, config.moe_num_experts, bias=False)
+        self.top_k = config.moe_num_experts_per_tok
+        self.softmax_order = config.moe_softmax_order
+
+    def forward(self, inputs: torch.Tensor):
+        # [batch_size * sequence_length, n_embd]
+        inputs_squashed = inputs.view(-1, inputs.shape[-1])
+        # [batch_size * sequence_length, num_experts]
+        router_logits = self.router(inputs_squashed)
+
+        # note that selected experts will be the same for all orders:
+        # softmax doesnt change top-k, but the weights are different
+        if self.softmax_order == "softmax_topk":
+            all_probs = F.softmax(router_logits, dim=1, dtype=torch.float32)
+            weights, selected_experts = torch.topk(all_probs, self.top_k)
+        elif self.softmax_order == "topk_softmax":
+            weights, selected_experts = torch.topk(router_logits, self.top_k)
+            weights = F.softmax(weights, dim=-1, dtype=torch.float32)
+        else:
+            raise ValueError(f"Unknown softmax_order: {self.softmax_order}")
+
+        results = torch.zeros_like(inputs_squashed)
+        # naive looping over experts
+        for i, expert in enumerate(self.experts):
+            batch_idx, nth_expert = torch.where(selected_experts == i)
+            output, _ = expert(inputs_squashed[batch_idx])
+            results[batch_idx] += weights[batch_idx, nth_expert, None] * output
+
+        # return results and router logits (for aux loss calculation later)
+        return results.view_as(inputs), {
+            "router_logits": router_logits,
+            "selected_experts": selected_experts,
+        }
+
 
 @dataclass
 class GPTConfig:
@@ -132,6 +258,10 @@ class GPTConfig:
     mup_width_multiplier: float = 1 # `mup_width_multiplier = width / base_width` where base_width is typically 256
     mup_input_alpha: float = 1 # Optional tunable multiplier applied to input embedding forward pass output
     mup_output_alpha: float = 1 # Optional tunable multiplier applied to output unembedding forward pass output
+    use_moe: bool = False
+    moe_num_experts: int = 8
+    moe_num_experts_per_tok: int = 1
+    moe_softmax_order: str = "softmax_topk"
 
 class GPT(nn.Module):
 
