@@ -12,3 +12,4 @@ env/
 venv/
 mup_examples/*/*/out/*
 completep_examples/*/*/out/*
+completep_examples/data
