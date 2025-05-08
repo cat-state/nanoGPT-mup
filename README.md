@@ -1,3 +1,76 @@
+# Don't be lazy: CompleteP enables compute-efficient deep transformers
+This branch contains a minimal implementation of CompleteP introduced in [Don't be lazy: CompleteP enables compute-efficient deep transformers](https://arxiv.org/abs/2505.01618).
+
+The `completep_examples`` folder contains code to reproduce the relative distance from linearization (Figure 6 from the paper)
+![linearization_distance](assets/linearization_distance.png)
+
+and the depth coordinate check (Figure 7 from the paper).
+![depth_coord_check](assets/depth_coord_check.png)
+
+
+To make everything easily searchable, each of the critical changes to implement Table 1 from the paper are marked with
+```
+### Begin CompleteP code ###
+<code for CompleteP change>
+### End CompleteP code ###
+```
+
+First code block
+```
+### Begin CompleteP code ###
+x = x + self.residual_scaling * self.attn(self.ln_1(x))
+x = x + self.residual_scaling * self.mlp(self.ln_2(x))
+### End CompleteP code ###
+```
+
+Second code block
+```
+### Begin CompleteP code ###
+adam_eps *= (1 / self.config.mup_width_multiplier) * (self.config.depth_multiplier ** (-1 * self.config.depth_alpha_exp))
+optim_groups = [
+    {
+        'params': emb_params,
+        'weight_decay': weight_decay,
+        'lr_scale': 1.0,
+    },
+    {
+        'params': hidden_ln_params,
+        'weight_decay': 0.0,
+        'lr_scale': depth_lr_scaling,
+    },
+    {
+        'params': hidden_weight_params,
+        'weight_decay': weight_decay / width_lr_scaling,
+        'lr_scale': width_lr_scaling * depth_lr_scaling,
+    },
+    {
+        'params': hidden_bias_params,
+        'weight_decay': 0.0,
+        'lr_scale': depth_lr_scaling,
+    },
+    {
+        'params': final_ln_params,
+        'weight_decay': 0.0,
+        'lr_scale': 1.0,
+    },
+]
+### End CompleteP code ###
+```
+
+Note that when `self.config.depth_alpha_exp = 1`, only the first code block is required, hence CompleteP (alpha=1) only requires 2 lines of code in addition to muP!
+
+If you would like to cite [Don't be lazy: CompleteP enables compute-efficient deep transformers](https://arxiv.org/abs/2505.01618), please use:
+```
+@misc{dey2025dontlazycompletepenables,
+      title={Don't be lazy: CompleteP enables compute-efficient deep transformers}, 
+      author={Nolan Dey and Bin Claire Zhang and Lorenzo Noci and Mufan Li and Blake Bordelon and Shane Bergsma and Cengiz Pehlevan and Boris Hanin and Joel Hestness},
+      year={2025},
+      eprint={2505.01618},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2505.01618}, 
+}
+```
 
 # nanoGPT-mup
 

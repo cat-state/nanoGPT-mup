@@ -225,8 +225,6 @@ model.to(device)
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
-depth_scale_lr = (depth_multiplier)**(depth_alpha_exp-1) if depth_alpha_enabled else 1.0
-learning_rate *= depth_scale_lr
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), adam_eps, device_type)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
@@ -414,5 +412,3 @@ while True:
 
 if ddp:
     destroy_process_group()
-            # elif module_name == 'lm_head':
-            #     coord_check_handles.append(module.register_forward_hook(partial(hook, key='lm_head')))

@@ -110,11 +110,13 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
-        self.res_scaling = 1/(config.depth_multiplier ** config.depth_alpha_exp) if config.depth_alpha_enabled else 1.0
+        self.residual_scaling = 1/(config.depth_multiplier ** config.depth_alpha_exp) if config.depth_alpha_enabled else 1.0
 
     def forward(self, x):
-        x = x + self.res_scaling * self.attn(self.ln_1(x))
-        x = x + self.res_scaling * self.mlp(self.ln_2(x))
+        ### Begin CompleteP code ###
+        x = x + self.residual_scaling * self.attn(self.ln_1(x))
+        x = x + self.residual_scaling * self.mlp(self.ln_2(x))
+        ### End CompleteP code ###
         return x
 
 @dataclass
@@ -133,9 +135,9 @@ class GPTConfig:
     mup_width_multiplier: float = 1 # `mup_width_multiplier = width / base_width` where base_width is typically 256
     mup_input_alpha: float = 1 # Optional tunable multiplier applied to input embedding forward pass output
     mup_output_alpha: float = 1 # Optional tunable multiplier applied to output unembedding forward pass output
-    depth_alpha_enabled: bool = False 
-    depth_multiplier: float = 1.0 # depth_multiplier = depth / base_depth` where base_width is typically 256
-    depth_alpha_exp: float = 1.0 # a float in the range [0.5, 1] that control how the branches are downscaled as a function of depth. This results in residual connections of the type x = x + 1/(L**alpha) branch(x)  
+    depth_alpha_enabled: bool = False
+    depth_multiplier: float = 1.0 # depth_multiplier = depth / base_depth`
+    depth_alpha_exp: float = 1.0 # a float in the range [0.5, 1] that controls how residual branches are scaled as a function of depth. This results in residual connections of the type x = x + depth_multiplier**(-depth_alpha_exp) * branch(x) with LR correction eta *= depth_multiplier**(depth_alpha_exp-1)
 
 class GPT(nn.Module):
 
@@ -145,8 +147,6 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
         
-        self.depth_forward_scaling = (self.config.depth_multiplier)**(1-self.config.depth_alpha_exp) if self.config.depth_alpha_enabled else 1.0
-
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
@@ -165,13 +165,12 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
-            if config.mup_enabled or config.depth_alpha_enabled:
+            if config.mup_enabled:
                 ### Begin muP code ###
                 # Adjust hidden weight initialization variance by 1 / mup_width_multiplier
                 if pn.endswith('c_attn.weight') or pn.endswith('c_fc.weight'):
                     torch.nn.init.normal_(p, mean=0.0, std=config.init_std / math.sqrt(config.mup_width_multiplier))
                 elif pn.endswith('c_proj.weight'):
-                    # torch.nn.init.normal_(p, mean=0.0, std=config.init_std / math.sqrt(2 * config.n_layer * config.mup_width_multiplier))
                     torch.nn.init.normal_(p, mean=0.0, std=config.init_std / math.sqrt(config.mup_width_multiplier))
                 ### End muP code ###
             elif pn.endswith('c_proj.weight'):
@@ -199,7 +198,7 @@ class GPT(nn.Module):
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.init_std / self.depth_forward_scaling)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.init_std)
 
     def forward(self, idx, targets=None):
         device = idx.device
@@ -210,7 +209,7 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop((tok_emb + pos_emb) * self.depth_forward_scaling)
+        x = self.transformer.drop((tok_emb + pos_emb))
         if self.config.mup_enabled:
             ### Begin muP code ###
             x *= self.config.mup_input_alpha
@@ -226,11 +225,11 @@ class GPT(nn.Module):
                 # Scaling `x` instead of `logits` allows coord check to log change
                 x *= self.config.mup_output_alpha / self.config.mup_width_multiplier
                 ### End muP code ###
-            logits = self.lm_head(x) * self.depth_forward_scaling
+            logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) * self.depth_forward_scaling # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
@@ -311,30 +310,87 @@ class GPT(nn.Module):
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         if self.config.mup_enabled and not self.config.mup_disable_hidden_lr_scaling:
-            ### Begin muP code ###
-            mup_decay_params = []
-            decay_params = []
-            nodecay_params = []
+            emb_params  = []
+            hidden_ln_params = []
+            hidden_weight_params = []
+            hidden_bias_params = []
+            final_ln_params = []
             for n, p in param_dict.items():
-                if p.dim() >= 2:
-                    if n.endswith('c_attn.weight') or n.endswith('c_fc.weight') or n.endswith('c_proj.weight'):
-                        mup_decay_params.append(p)
-                    else:
-                        decay_params.append(p)
+                if n in ('transformer.wte.weight', 'transformer.wpe.weight'):
+                    emb_params.append(p)
+                elif '.ln_' in n and not '.ln_f.' in n:
+                    hidden_ln_params.append(p)
+                elif n.endswith('c_attn.weight') or n.endswith('c_fc.weight') or n.endswith('c_proj.weight'):
+                    hidden_weight_params.append(p)
+                elif n.endswith('c_attn.bias') or n.endswith('c_fc.bias') or n.endswith('c_proj.bias'):
+                    hidden_bias_params.append(p)
+                elif '.ln_f.' in n:
+                    final_ln_params.append(p)
                 else:
-                    nodecay_params.append(p)
-            optim_groups = [
-                {'params': mup_decay_params, 'weight_decay': weight_decay, 'lr_scale': 1/self.config.mup_width_multiplier},
-                {'params': decay_params, 'weight_decay': weight_decay, 'lr_scale': 1},
-                {'params': nodecay_params, 'weight_decay': 0.0, 'lr_scale': 1}
-            ]
-            num_mup_decay_params = sum(p.numel() for p in mup_decay_params)
-            num_decay_params = sum(p.numel() for p in decay_params)
-            num_nodecay_params = sum(p.numel() for p in nodecay_params)
-            print(f"num mup decayed parameter tensors: {len(mup_decay_params)}, with {num_mup_decay_params:,} parameters")
-            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-            ### End muP code ###
+                    raise Exception(f'Unhandled parameter {n}')
+            depth_lr_scaling = (self.config.depth_multiplier ** (self.config.depth_alpha_exp - 1))
+            width_lr_scaling = (1 / self.config.mup_width_multiplier)
+            if self.config.depth_alpha_enabled:
+                ### Begin CompleteP code ###
+                adam_eps *= (1 / self.config.mup_width_multiplier) * (self.config.depth_multiplier ** (-1 * self.config.depth_alpha_exp))
+                optim_groups = [
+                    {
+                        'params': emb_params,
+                        'weight_decay': weight_decay,
+                        'lr_scale': 1.0,
+                    },
+                    {
+                        'params': hidden_ln_params,
+                        'weight_decay': 0.0,
+                        'lr_scale': depth_lr_scaling,
+                    },
+                    {
+                        'params': hidden_weight_params,
+                        'weight_decay': weight_decay / width_lr_scaling,
+                        'lr_scale': width_lr_scaling * depth_lr_scaling,
+                    },
+                    {
+                        'params': hidden_bias_params,
+                        'weight_decay': 0.0,
+                        'lr_scale': depth_lr_scaling,
+                    },
+                    {
+                        'params': final_ln_params,
+                        'weight_decay': 0.0,
+                        'lr_scale': 1.0,
+                    },
+                ]
+                ### End CompleteP code ###
+            else:
+                ### Begin muP code ###
+                optim_groups = [
+                    {
+                        'params': emb_params,
+                        'weight_decay': weight_decay,
+                        'lr_scale': 1.0,
+                    },
+                    {
+                        'params': hidden_ln_params,
+                        'weight_decay': 0.0,
+                        'lr_scale': 1.0,
+                    },
+                    {
+                        'params': hidden_weight_params,
+                        'weight_decay': weight_decay,
+                        'lr_scale': width_lr_scaling,
+                    },
+                    {
+                        'params': hidden_bias_params,
+                        'weight_decay': 0.0,
+                        'lr_scale': 1.0,
+                    },
+                    {
+                        'params': final_ln_params,
+                        'weight_decay': 0.0,
+                        'lr_scale': 1.0,
+                    },
+                ]
+                ### End muP code ###
         else:
             decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
             nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
