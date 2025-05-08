@@ -1,12 +1,8 @@
 # Don't be lazy: CompleteP enables compute-efficient deep transformers
 This branch contains a minimal implementation of CompleteP introduced in [Don't be lazy: CompleteP enables compute-efficient deep transformers](https://arxiv.org/abs/2505.01618).
 
-The `completep_examples`` folder contains code to reproduce the relative distance from linearization (Figure 6 from the paper)
-![linearization_distance](assets/linearization_distance.png)
-
-and the depth coordinate check (Figure 7 from the paper).
-![depth_coord_check](assets/depth_coord_check.png)
-
+### Implementation
+![parameterization_summary](assets/parameterization_summary.png)
 
 To make everything easily searchable, each of the critical changes to implement Table 1 from the paper are marked with
 ```
@@ -59,6 +55,14 @@ optim_groups = [
 
 Note that when `self.config.depth_alpha_exp = 1`, only the first code block is required, hence CompleteP (alpha=1) only requires 2 lines of code in addition to muP!
 
+### Experiment reproduction
+The `completep_examples`` folder contains code to reproduce the relative distance from linearization (Figure 6 from the paper)
+![linearization_distance](assets/linearization_distance.png)
+
+and the depth coordinate check (Figure 7 from the paper).
+![depth_coord_check](assets/depth_coord_check.png)
+
+### Citation
 If you would like to cite [Don't be lazy: CompleteP enables compute-efficient deep transformers](https://arxiv.org/abs/2505.01618), please use:
 ```
 @misc{dey2025dontlazycompletepenables,
