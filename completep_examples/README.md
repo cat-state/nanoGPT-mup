@@ -6,6 +6,7 @@ This folder contains code to reproduce Figure 6 and 7 from [Don't be lazy: Compl
 
 To reproduce this figure, run the notebook `completep_examples/relative_distance_from_linearization.ipynb`.
 If you would only like to plot the results you just run the "plotting" section of the notebook.
+
 ![linearization_distance](../assets/linearization_distance.png)
 
 ### Depth coordinate check(Figure 7)
