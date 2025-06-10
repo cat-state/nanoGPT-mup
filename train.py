@@ -60,6 +60,13 @@ n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 init_std = 0.02 # Initialization standard deviation for weights
+# mixture‑of‑experts
+moe_enabled      = False   # turn on with --moe_enabled=True
+moe_num_experts  = 4       # experts per MoE layer
+moe_top_k        = 2       # top‑k experts per token (1 or 2)
+moe_router_type   = 'switch'   # 'switch', 'hash', or 'sinkhorn'
+moe_sinkhorn_iters= 3
+moe_aux_loss_coef = 0.05
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -167,7 +174,9 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   mup_disable_attention_scaling=mup_disable_attention_scaling,
                   mup_disable_hidden_lr_scaling=mup_disable_hidden_lr_scaling,
                   mup_width_multiplier=mup_width_multiplier, mup_input_alpha=mup_input_alpha,
-                  mup_output_alpha=mup_output_alpha) # start with model_args from command line
+                  mup_output_alpha=mup_output_alpha, use_moe=moe_enabled, moe_num_experts=moe_num_experts, 
+                  moe_top_k=moe_top_k,moe_router_type=moe_router_type, moe_sinkhorn_iters=moe_sinkhorn_iters, 
+                  moe_aux_loss_coef=moe_aux_loss_coef) # start with model_args from command line
 
 if init_from == 'scratch':
     # init a new model from scratch
