@@ -22,6 +22,7 @@ import math
 import pickle
 from contextlib import nullcontext
 from functools import partial
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -34,36 +35,36 @@ from model import GPTConfig, GPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 2000
+eval_interval = 10
 log_interval = 1
-eval_iters = 200
+eval_iters = 20
 eval_only = False # if True, script exits right after the first eval
 skip_val_loss = False # If True, will only measure train loss
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
-never_save_checkpoint = False # if True, never save a checkpoint
+always_save_checkpoint = False # if True, always save a checkpoint after each eval
+never_save_checkpoint = True # if True, never save a checkpoint
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
+wandb_log = True # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # csv logging
 csv_log = False # If enabled, logs stats to a csv file
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 2 # used to simulate larger batch sizes
+batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
-n_layer = 12
+n_layer = 4
 n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 init_std = 0.02 # Initialization standard deviation for weights
 # mixture‑of‑experts
-moe_enabled      = False   # turn on with --moe_enabled=True
+moe_enabled      = True   # turn on with --moe_enabled=True
 moe_num_experts  = 4       # experts per MoE layer
-moe_top_k        = 2       # top‑k experts per token (1 or 2)
+moe_top_k        = 1       # top‑k experts per token (1 or 2)
 moe_router_type   = 'switch'   # 'switch', 'hash', or 'sinkhorn'
 moe_sinkhorn_iters= 3
 moe_aux_loss_coef = 0.05
@@ -241,7 +242,7 @@ if compile:
 
 # wrap model into DDP container
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True, gradient_as_bucket_view=True)
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -251,12 +252,17 @@ def estimate_loss():
     splits = ['train'] if skip_val_loss else ['train', 'val']
     for split in splits:
         losses = torch.zeros(eval_iters)
+        expert_dists = []
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss, expert_distributions = model(X, Y)
             losses[k] = loss.item()
+            if expert_distributions:
+                expert_dists.append(torch.stack(expert_distributions))
         out[split] = losses.mean().item()
+        if expert_dists:
+            out[f'{split}_expert_dist'] = torch.stack(expert_dists).mean(dim=0)
     if skip_val_loss:
         out['val'] = -1
     model.train()
@@ -294,6 +300,8 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 coord_check_dict = None
+routing_cache = defaultdict(lambda: defaultdict(list)) 
+
 while True:
 
     # determine and set the learning rate for this iteration
@@ -314,6 +322,41 @@ while True:
             "lr": lr,
             "mfu": running_mfu*100, # convert to percentage
         }
+
+        for split in ["train", "val"]:
+            dist_key = f"{split}_expert_dist"
+            if dist_key not in losses:
+                continue
+
+            # losses[dist_key] → shape  [num_layers, num_experts]
+            for layer_idx, dist in enumerate(losses[dist_key]):
+                total_tokens_in_layer = dist.sum()
+                if total_tokens_in_layer == 0:
+                    continue
+
+                dist_pct = (dist / total_tokens_in_layer) * 100
+                step     = iter_num
+
+                # ---------- cache this step ----------
+                for expert_idx, pct in enumerate(dist_pct.cpu().numpy()):
+                    routing_cache[(split, layer_idx)][expert_idx].append((step, pct))
+
+                # ---------- build xs/ys for wandb.plot ----------
+                xs, ys, keys = [], [], []
+                for expert_idx, series in routing_cache[(split, layer_idx)].items():
+                    xs.append([p[0] for p in series])     # iterations
+                    ys.append([p[1] for p in series])     # %
+                    keys.append(f"Expert {expert_idx}")
+
+                chart_name = f"Routing Percentage/{split.capitalize()} Layer {layer_idx}"
+                log_dict[chart_name] = wandb.plot.line_series(
+                    xs=xs,
+                    ys=ys,
+                    keys=keys,
+                    title=f"{split.capitalize()} Layer {layer_idx} Routing %",
+                    xname="iteration",
+                )
+
         if mup_enable_coord_check_logging and coord_check_dict is not None:
             for key in coord_check_dict:
                 log_dict[key + '_act_abs_mean'] = np.mean(coord_check_dict[key])
@@ -371,7 +414,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss, _ = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')

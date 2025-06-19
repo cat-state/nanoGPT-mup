@@ -117,8 +117,9 @@ class _Expert(nn.Module):
 # ----------- MoE Router Variants --------------
 def _switch_topk(logits, k):
     """Switch/Top‑k. Returns (indices, probs)."""
-    topk_val, topk_idx = torch.topk(logits, k, dim=-1)
-    gate = topk_val.softmax(dim=-1)
+    probs      = logits.softmax(dim=-1)
+    topk_val, topk_idx = torch.topk(probs, k, dim=-1)
+    gate       = topk_val / topk_val.sum(dim=-1, keepdim=True)
     return topk_idx, gate
 
 
@@ -127,9 +128,12 @@ def _hash_router(x, num_experts, k):
     Deterministic “hash” routing: project to scalar, bucket‑mod #experts.
     *Always* k = 1; we still return shapes consistent with _switch_topk.
     """
+    if k != 1:
+        raise ValueError("hash router currently supports top-k=1")
     proj = (x.sum(dim=-1) * 131).to(torch.int64)
-    idx  = (proj.abs() % num_experts).unsqueeze(-1)
-    return idx, torch.ones_like(idx, dtype=x.dtype)
+    idx  = (proj.abs() % num_experts).unsqueeze(-1)   # (..., 1)
+    gate = torch.ones_like(idx, dtype=x.dtype)        # prob = 1
+    return idx, gate
 
 
 def _sinkhorn(logits: torch.Tensor,
@@ -198,18 +202,16 @@ class MoE(nn.Module):
 
         # aux loss
         with torch.autocast(device_type="cpu", enabled=False):
-            # counts per‑expert (#tokens routed, ignoring k>1 duplicates)
-            flat_expert = idx_flat[:, 0]
             tokens_per_expert = torch.bincount(
-                flat_expert, minlength=self.num_experts
+                idx_flat.flatten(), minlength=self.num_experts
             ).float()
 
             frac = tokens_per_expert / tokens_per_expert.sum()
             probs = logits.softmax(dim=-1).reshape(-1, self.num_experts).mean(0)
             # Switch paper:  L_aux = E * <load,prob>
-            aux = (self.num_experts * (frac * probs).sum()).pow(2)
+            aux = self.num_experts * (frac * probs).sum()
 
-        return y, aux
+        return y, aux, tokens_per_expert
 
 
 class Block(nn.Module):
@@ -225,10 +227,10 @@ class Block(nn.Module):
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
         if self.has_moe:
-            y, aux = self.ffn(self.ln_2(x))
-            return x + y, aux
+            y, aux, expert_distribution = self.ffn(self.ln_2(x))
+            return x + y, aux, expert_distribution
         else:
-            return x + self.ffn(self.ln_2(x)), 0.0
+            return x + self.ffn(self.ln_2(x)), 0.0, None
 
 @dataclass
 class GPTConfig:
@@ -329,9 +331,13 @@ class GPT(nn.Module):
             ### Begin muP code ###
             x *= self.config.mup_input_alpha
             ### End muP code ###
+        total_aux = 0.0
+        expert_distributions = []
         for block in self.transformer.h:
-            x, aux = block(x)
+            x, aux, expert_distribution = block(x)
             total_aux += aux
+            if expert_distribution is not None:
+                expert_distributions.append(expert_distribution)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -350,7 +356,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        return logits, loss, expert_distributions
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
