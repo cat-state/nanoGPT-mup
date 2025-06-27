@@ -253,16 +253,21 @@ def estimate_loss():
     for split in splits:
         losses = torch.zeros(eval_iters)
         expert_dists = []
+        router_entropies = []
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss, expert_distributions = model(X, Y)
+                logits, loss, expert_distributions, router_Hs = model(X, Y)
             losses[k] = loss.item()
             if expert_distributions:
                 expert_dists.append(torch.stack(expert_distributions))
+            if router_Hs:
+                router_entropies.append(torch.stack(router_Hs))
         out[split] = losses.mean().item()
         if expert_dists:
             out[f'{split}_expert_dist'] = torch.stack(expert_dists).mean(dim=0)
+        if router_entropies:
+            out[f'{split}_router_entropy'] = torch.stack(router_entropies).mean(dim=0)
     if skip_val_loss:
         out['val'] = -1
     model.train()
@@ -300,7 +305,8 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 coord_check_dict = None
-routing_cache = defaultdict(lambda: defaultdict(list)) 
+routing_cache = defaultdict(lambda: defaultdict(list))
+router_entropy_cache = defaultdict(list)
 
 while True:
 
@@ -357,11 +363,31 @@ while True:
                     xname="iteration",
                 )
 
+            # ---------- router entropy ----------
+            ent_key = f"{split}_router_entropy"
+            if ent_key in losses:
+                for layer_idx, ent in enumerate(losses[ent_key]):
+                    step  = iter_num
+                    router_entropy_cache[(split, layer_idx)].append((step, ent.item()))
+
+                    xs  = [[p[0] for p in router_entropy_cache[(split, layer_idx)]]]
+                    ys  = [[p[1] for p in router_entropy_cache[(split, layer_idx)]]]
+                    keys = ["Entropy"]
+
+                    chart_name = f"Router Entropy/{split.capitalize()} Layer {layer_idx}"
+                    log_dict[chart_name] = wandb.plot.line_series(
+                        xs=xs,
+                        ys=ys,
+                        keys=keys,
+                        title=chart_name,
+                        xname="iteration",
+                    )
+
         if mup_enable_coord_check_logging and coord_check_dict is not None:
             for key in coord_check_dict:
                 log_dict[key + '_act_abs_mean'] = np.mean(coord_check_dict[key])
         if wandb_log:
-            wandb_run.log(log_dict)
+            wandb_run.log(log_dict, step=iter_num)
         if csv_log:
             csv_logger.log(log_dict)
             csv_logger.step()
@@ -414,7 +440,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss, _ = model(X, Y)
+            logits, loss, _, _ = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')

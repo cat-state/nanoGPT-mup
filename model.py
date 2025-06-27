@@ -187,6 +187,10 @@ class MoE(nn.Module):
         gate_flat = gate.reshape(BT, self.top_k)
         idx_flat  = topk_idx.reshape(BT, self.top_k)
 
+        eps       = 1e-9
+        token_H   = -(gate_flat * (gate_flat + eps).log()).sum(-1)      # (B·T,)
+        router_H  = token_H.mean() / math.log(float(self.num_experts))  # scalar ∈ [0,1]
+
         for expert_id in range(self.num_experts):
             sel_mask = (idx_flat == expert_id)
             if not sel_mask.any():
@@ -211,7 +215,7 @@ class MoE(nn.Module):
             # Switch paper:  L_aux = E * <load,prob>
             aux = self.num_experts * (frac * probs).sum()
 
-        return y, aux, tokens_per_expert
+        return y, aux, tokens_per_expert, router_H
 
 
 class Block(nn.Module):
@@ -227,10 +231,10 @@ class Block(nn.Module):
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
         if self.has_moe:
-            y, aux, expert_distribution = self.ffn(self.ln_2(x))
-            return x + y, aux, expert_distribution
+            y, aux, expert_distribution, router_H = self.ffn(self.ln_2(x))
+            return x + y, expert_distribution, aux, router_H
         else:
-            return x + self.ffn(self.ln_2(x)), 0.0, None
+            return x + self.ffn(self.ln_2(x)), None, 0.0, None
 
 @dataclass
 class GPTConfig:
@@ -331,13 +335,17 @@ class GPT(nn.Module):
             ### Begin muP code ###
             x *= self.config.mup_input_alpha
             ### End muP code ###
+
         total_aux = 0.0
         expert_distributions = []
+        router_entropies = []
+
         for block in self.transformer.h:
-            x, aux, expert_distribution = block(x)
+            x, expert_dist, aux, router_H = block(x)
             total_aux += aux
-            if expert_distribution is not None:
-                expert_distributions.append(expert_distribution)
+            if expert_dist is not None:
+                expert_distributions.append(expert_dist)
+                router_entropies.append(router_H)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -356,7 +364,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss, expert_distributions
+        return logits, loss, expert_distributions, router_entropies
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
