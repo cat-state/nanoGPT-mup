@@ -102,6 +102,123 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+
+class _Expert(nn.Module):
+    """Single FFN expert: GELU(FC)->FC"""
+    def __init__(self, config):
+        super().__init__()
+        h = 4 * config.n_embd
+        self.fc1 = nn.Linear(config.n_embd, h,  bias=config.bias)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(h,            config.n_embd, bias=config.bias)
+    def forward(self, x):
+        return self.fc2(self.act(self.fc1(x)))
+
+# ----------- MoE Router Variants --------------
+def _switch_topk(logits, k):
+    """Switch/Top‑k. Returns (indices, probs)."""
+    probs      = logits.softmax(dim=-1)
+    topk_val, topk_idx = torch.topk(probs, k, dim=-1)
+    gate       = topk_val / topk_val.sum(dim=-1, keepdim=True)
+    return topk_idx, probs, gate
+
+
+def _hash_router(x, num_experts, k):
+    """
+    Deterministic “hash” routing: project to scalar, bucket‑mod #experts.
+    *Always* k = 1; we still return shapes consistent with _switch_topk.
+    """
+    if k != 1:
+        raise ValueError("hash router currently supports top-k=1")
+    proj = (x.sum(dim=-1) * 131).to(torch.int64)
+    idx  = (proj.abs() % num_experts).unsqueeze(-1)   # (..., 1)
+    gate = torch.ones_like(idx, dtype=x.dtype)        # prob = 1
+    return idx, gate, gate
+
+
+def _sinkhorn(logits: torch.Tensor,
+             iters: int = 3,
+             eps: float = 1e-9) -> torch.Tensor:
+    """
+    Args
+    ----
+    logits : (..., N, E)  un‑normalised routing scores
+    iters  : iterations of alternating row / col normalisation
+    eps    : numerical floor to avoid division by zero
+    """
+    P = logits.float().exp()
+    for _ in range(iters):
+        P /= P.sum(-1, keepdim=True).clamp_min(eps)
+        P /= P.sum(-2, keepdim=True).clamp_min(eps)
+    return P.type_as(logits)
+
+class MoE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.moe_num_experts
+        self.top_k       = config.moe_top_k
+        assert 1 <= self.top_k <= self.num_experts, "`k` must be in [1, #experts]"
+        self.router_type  = config.moe_router_type
+        self.sink_iters   = config.moe_sinkhorn_iters
+
+        self.experts = nn.ModuleList([_Expert(config) for _ in range(self.num_experts)])
+        self.router  = nn.Linear(config.n_embd, self.num_experts, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        logits = self.router(x)
+        if self.router_type == "switch":
+            topk_idx, probs, gate = _switch_topk(logits, self.top_k)
+        elif self.router_type == "hash":
+            topk_idx, probs, gate = _hash_router(x, self.num_experts, self.top_k)
+        elif self.router_type == "sinkhorn":
+            with torch.no_grad():
+                ds = _sinkhorn(logits, iters=self.sink_iters)
+                topk_val, topk_idx = torch.topk(ds, self.top_k, dim=-1)
+            gate = topk_val / topk_val.sum(dim=-1, keepdim=True)
+        else:
+            raise ValueError(f"unknown router_type '{self.router_type}'")
+
+        B, T, C = x.shape
+        BT      = B * T
+        x_flat  = x.reshape(BT, C)
+        y_flat  = torch.zeros_like(x_flat)
+
+        probs_flat = probs.reshape(BT, -1)
+        gate_flat = gate.reshape(BT, self.top_k)
+        idx_flat  = topk_idx.reshape(BT, self.top_k)
+
+        eps       = 1e-9
+        token_H   = -(probs_flat * (probs_flat + eps).log()).sum(-1)      # (B·T,)
+        router_H  = token_H.mean() / math.log(float(self.num_experts))  # scalar ∈ [0,1]
+
+        for expert_id in range(self.num_experts):
+            sel_mask = (idx_flat == expert_id)
+            if not sel_mask.any():
+                continue
+            token_rows, which_k = torch.nonzero(sel_mask, as_tuple=True)
+            inp   = x_flat.index_select(0, token_rows)
+            out   = self.experts[expert_id](inp)
+            coeff = gate_flat[token_rows, which_k].unsqueeze(1)
+            y_flat.index_add_(0, token_rows, out * coeff)
+
+        y = y_flat.view_as(x)
+        y = self.dropout(y)
+
+        # aux loss
+        with torch.autocast(device_type="cpu", enabled=False):
+            tokens_per_expert = torch.bincount(
+                idx_flat.flatten(), minlength=self.num_experts
+            ).float()
+
+            frac = tokens_per_expert / tokens_per_expert.sum()
+            probs = logits.softmax(dim=-1).reshape(-1, self.num_experts).mean(0)
+            # Switch paper:  L_aux = E * <load,prob>
+            aux = self.num_experts * (frac * probs).sum()
+
+        return y, aux, tokens_per_expert, router_H
+
+
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -109,12 +226,16 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.has_moe = config.use_moe
+        self.ffn = MoE(config) if self.has_moe else MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+        if self.has_moe:
+            y, aux, expert_distribution, router_H = self.ffn(self.ln_2(x))
+            return x + y, expert_distribution, aux, router_H
+        else:
+            return x + self.ffn(self.ln_2(x)), None, 0.0, None
 
 @dataclass
 class GPTConfig:
@@ -126,12 +247,20 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     init_std: float = 0.02
+    # ---- mup config settings ---------
     mup_enabled: bool = False # Whether to use muP. If False then all other mup variables are ignored
     mup_disable_attention_scaling: bool = False # Disables mup attention scaling
     mup_disable_hidden_lr_scaling: bool = False # Disables mup hidden LR scaling
     mup_width_multiplier: float = 1 # `mup_width_multiplier = width / base_width` where base_width is typically 256
     mup_input_alpha: float = 1 # Optional tunable multiplier applied to input embedding forward pass output
     mup_output_alpha: float = 1 # Optional tunable multiplier applied to output unembedding forward pass output
+    # ---- Mixture‑of‑Experts config settings ---------
+    use_moe: bool   = False
+    moe_num_experts: int = 4
+    moe_top_k: int  = 2
+    moe_router_type: str = "switch"      # "switch" | "hash" | "sinkhorn"
+    moe_sinkhorn_iters: int = 3
+    moe_aux_loss_coef: float = 0.05      # weight on load‑balancing loss
 
 class GPT(nn.Module):
 
@@ -207,8 +336,17 @@ class GPT(nn.Module):
             ### Begin muP code ###
             x *= self.config.mup_input_alpha
             ### End muP code ###
+
+        total_aux = 0.0
+        expert_distributions = []
+        router_entropies = []
+
         for block in self.transformer.h:
-            x = block(x)
+            x, expert_dist, aux, router_H = block(x)
+            total_aux += aux
+            if expert_dist is not None:
+                expert_distributions.append(expert_dist)
+                router_entropies.append(router_H)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -220,12 +358,14 @@ class GPT(nn.Module):
                 ### End muP code ###
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # add load‑balancing auxiliary term
+            loss = loss + self.config.moe_aux_loss_coef * total_aux
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        return logits, loss, expert_distributions, router_entropies
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
