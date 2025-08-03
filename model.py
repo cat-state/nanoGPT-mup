@@ -118,20 +118,18 @@ class _Expert(nn.Module):
 def _switch_topk(logits, k):
     """Switch/Top‑k. Returns (indices, probs)."""
     probs      = logits.softmax(dim=-1)
-    topk_val, topk_idx = torch.topk(probs, k, dim=-1)
-    gate       = topk_val / topk_val.sum(dim=-1, keepdim=True)
+    gate, topk_idx = torch.topk(probs, k, dim=-1)
     return topk_idx, probs, gate
 
 
-def _hash_router(x, num_experts, k):
+def _hash_router(x, idx, num_experts, k):
     """
     Deterministic “hash” routing: project to scalar, bucket‑mod #experts.
     *Always* k = 1; we still return shapes consistent with _switch_topk.
     """
     if k != 1:
         raise ValueError("hash router currently supports top-k=1")
-    proj = (x.sum(dim=-1) * 131).to(torch.int64)
-    idx  = (proj.abs() % num_experts).unsqueeze(-1)   # (..., 1)
+    idx  = (idx % num_experts).unsqueeze(-1)   # (..., 1)
     gate = torch.ones_like(idx, dtype=x.dtype)        # prob = 1
     return idx, gate, gate
 
@@ -165,12 +163,12 @@ class MoE(nn.Module):
         self.router  = nn.Linear(config.n_embd, self.num_experts, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x):
+    def forward(self, x, idx=None):
         logits = self.router(x)
         if self.router_type == "switch":
             topk_idx, probs, gate = _switch_topk(logits, self.top_k)
         elif self.router_type == "hash":
-            topk_idx, probs, gate = _hash_router(x, self.num_experts, self.top_k)
+            topk_idx, probs, gate = _hash_router(x, idx, self.num_experts, self.top_k)
         elif self.router_type == "sinkhorn":
             with torch.no_grad():
                 ds = _sinkhorn(logits, iters=self.sink_iters)
@@ -229,10 +227,10 @@ class Block(nn.Module):
         self.has_moe = config.use_moe
         self.ffn = MoE(config) if self.has_moe else MLP(config)
 
-    def forward(self, x):
+    def forward(self, x, idx=None):
         x = x + self.attn(self.ln_1(x))
         if self.has_moe:
-            y, aux, expert_distribution, router_H = self.ffn(self.ln_2(x))
+            y, aux, expert_distribution, router_H = self.ffn(self.ln_2(x), idx)
             return x + y, expert_distribution, aux, router_H
         else:
             return x + self.ffn(self.ln_2(x)), None, 0.0, None
@@ -342,7 +340,7 @@ class GPT(nn.Module):
         router_entropies = []
 
         for block in self.transformer.h:
-            x, expert_dist, aux, router_H = block(x)
+            x, expert_dist, aux, router_H = block(x, idx)
             total_aux += aux
             if expert_dist is not None:
                 expert_distributions.append(expert_dist)
